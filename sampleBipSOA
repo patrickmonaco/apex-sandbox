@@ -1,0 +1,136 @@
+create or replace procedure elc_getletter(pid INTEGER,
+                                          ptype VARCHAR2 default 'G'
+                                          )
+as
+-- -----------------------------------------------------------------------------
+-- ELC_GETLETTER
+-- Generate all kinds of letter related to booking
+-- Use passing the xml directly in the payload (reportData) 
+-- PMO - V 1.0
+-- -----------------------------------------------------------------------------
+  l_envelope  CLOB;
+  l_clob  CLOB;
+  l_xml       XMLTYPE;
+  l_result    VARCHAR2(32767);
+  l_blob BLOB;
+  l_base64 CLOB;
+  nb   number;
+  l_type varchar2(100);
+  tname VARCHAR2(200);
+  tdest VARCHAR2(1);
+  tuserid VARCHAR2(50);
+  tpwd VARCHAR2(50);
+  tdos VARCHAR2(8);
+  tlot INTEGER;
+  terr VARCHAR2(500);
+  tpl VARCHAR2(200); -- template for Agent or Direct guest
+  tplguest VARCHAR2(200); -- template  for Indirect guest
+  v_code VARCHAR2(30);
+  v_errm VARCHAR2(200);
+  fguest VARCHAR2(1) :='';
+  tdirect varchar2(1);
+  tlayout varchar2(200);
+  xmldata varchar2(32000);
+  tblob BLOB;
+  tclob CLOB;
+  thash VARCHAR2(100);
+  tendpoint varchar2(300);
+  treport varchar2(200);
+  SOAP exception ;
+BEGIN
+-- Get XML data
+tblob := elc_getxml(pid, ptype,1);
+-- Encode XML in base 64
+tclob := APEX_WEB_SERVICE.BLOB2CLOBBASE64(tblob);
+xmldata := to_char(tclob);
+
+-- Get credentials
+select userid, pwd into tuserid,tpwd
+from ELC_KEYS
+where NAME = (select 
+              VALUE from ELC_SETUP 
+              where name = 'BIP_KEYS');
+              
+select nodossier, file_id into tdos, tlot
+from ELC_DOSSIERS where ID = pid;
+-- get parameters
+    select value into tpl 
+    from ELC_SETUP
+    where name = 'TEMPLATE_PREFIX';
+-- get setup parameters    
+-- get endpoint in the form of: http://<BIPSERVER:PORT>/xmlpserver/services/v2/ReportService
+    select value into tendpoint 
+    from ELC_SETUP
+    where name = 'BIP_ENDPOINT';
+    select value into tplguest
+    from ELC_SETUP
+    where name = 'TEMPLATE_PREFIXG';
+    select FLAG_DIRECT into tdirect from ELC_BKG
+    where bookid = pid;
+
+    select value into treport
+    from ELC_SETUP
+    where name = 'REPORT_NAME';
+
+-- Choose the right report Layout
+  if tdirect ='I' and ptype = 'G' then
+    tlayout := tplguest;
+  else
+    tlayout := tpl;
+  end if;  
+
+  -- Build a SOAP appropriate document  for the web service.
+  l_envelope := '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
+   <soapenv:Header/>
+   <soapenv:Body>
+      <v2:runReport>
+         <v2:reportRequest>
+           <v2:attributeFormat>pdf</v2:attributeFormat>
+            <v2:attributeTemplate>' || tlayout ||'</v2:attributeTemplate>
+            <v2:byPassCache>true</v2:byPassCache>
+            <v2:reportAbsolutePath>' || treport || '</v2:reportAbsolutePath>
+            <v2:reportData>'|| xmldata ||'</v2:reportData> 
+         </v2:reportRequest>
+         <v2:userID>' || tuserid ||'</v2:userID>
+         <v2:password>' || tpwd || '</v2:password>
+      </v2:runReport>
+   </soapenv:Body>
+</soapenv:Envelope>
+';
+
+
+l_xml := apex_web_service.make_request(
+   p_url               => tendpoint,
+   p_envelope          => l_envelope );
+   
+-- Check if an error occured
+terr := apex_web_service.parse_xml_clob(l_xml, '//*:faultcode/text()');
+if terr > '' then
+  RAISE SOAP;
+end if;  
+
+-- convert into a BLOB datatype
+l_base64 := apex_web_service.parse_xml_clob(l_xml, '//*:reportBytes/text()');
+l_type := apex_web_service.parse_xml(l_xml, '//*:reportContentType/text()');
+l_blob := apex_web_service.clobbase642blob(l_base64);
+
+-- update repository table
+tname := tlot||'.'||tdos||'.'||ptype||'.pdf';
+thash := elc.generate_md5(xmldata);
+insert into elc_pdf (data, url, notes, dated, book_id) values (l_blob, tname, l_type, SYSDATE, pid);
+update elc_dossiers set GENERATED =1, HASH=thash where id = pid;
+commit;
+
+exception
+
+    when SOAP then
+        insert into elc_log (dated,log) values (SYSDATE, 'elc_getletter2 - dossier ' || pid ||' / ' || 'Pb during calling Webservice');
+        commit;
+    when others then
+        v_code := SQLCODE;
+        v_errm := SUBSTR(SQLERRM, 1 , 64);
+       -- dbms_output.put_line(v_code || v_errm);
+        insert into elc_log (dated,log) values (SYSDATE, 'elc_getletter2 - dossier ' || pid || ' / '|| v_code ||'-'||v_errm);
+        commit;
+
+end;
